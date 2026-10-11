@@ -1,0 +1,166 @@
+"""Input helpers for CSV and FITS light curves.
+
+This reader is intentionally conservative: inspect data headers first and verify
+that inferred timestamp semantics match the relevant instrument manual.
+"""
+from __future__ import annotations
+from pathlib import Path
+from typing import Optional
+import numpy as np
+import pandas as pd
+
+TIME_NAMES = {"time", "timestamp", "datetime", "date_time", "utc", "time_utc", "ut"}
+VALUE_HINTS = ("count", "rate", "flux", "intens", "signal", "value", "lc")
+
+
+def inspect_file(path: str | Path) -> list[dict]:
+    """Return table/HDU schema summaries for a CSV or FITS file."""
+    path = Path(path)
+    suffixes = "".join(path.suffixes).lower()
+    summaries = []
+    if suffixes.endswith(".csv") or suffixes.endswith(".txt"):
+        frame = pd.read_csv(path, nrows=5, comment="#", sep=None, engine="python")
+        summaries.append({"table": "CSV", "rows_previewed": len(frame), "columns": list(frame.columns), "preview": frame.head(3).to_dict("records")})
+        return summaries
+    if not any(suffixes.endswith(ext) for ext in (".fits", ".fit", ".fts", ".fits.gz", ".fit.gz", ".fts.gz")):
+        raise ValueError(f"Unsupported file extension: {path.name}. Use CSV/TXT or FITS.")
+    try:
+        from astropy.io import fits
+    except ImportError as exc:
+        raise RuntimeError("FITS support requires astropy. Install requirements.txt first.") from exc
+    with fits.open(path, memmap=False) as hdus:
+        for index, hdu in enumerate(hdus):
+            item = {"table": index, "extname": hdu.header.get("EXTNAME", "PRIMARY" if index == 0 else ""), "hdu_type": type(hdu).__name__, "columns": []}
+            if getattr(hdu, "columns", None) is not None and hdu.data is not None:
+                item["rows"] = len(hdu.data)
+                item["columns"] = list(hdu.columns.names or [])
+                item["preview"] = {name: np.asarray(hdu.data[name][:3]).tolist() for name in item["columns"][:8]}
+            item["time_keywords"] = {k: hdu.header[k] for k in ("TIMESYS", "TIMEUNIT", "MJDREF", "MJDREFI", "MJDREFF", "TIMEZERO", "TSTART", "TSTOP") if k in hdu.header}
+            summaries.append(item)
+    return summaries
+
+
+def _find_time_column(columns) -> Optional[str]:
+    norm = {str(c).strip().lower(): c for c in columns}
+    for name in TIME_NAMES:
+        if name in norm:
+            return norm[name]
+    for c in columns:
+        if "time" in str(c).lower() or str(c).lower() in {"ut", "utc"}:
+            return c
+    return None
+
+
+def _find_value_column(columns, time_col: str) -> Optional[str]:
+    candidates = [c for c in columns if c != time_col]
+    # Prefer rate/count/flux-like names rather than status or quality flags.
+    ranked = sorted(candidates, key=lambda c: (0 if any(h in str(c).lower() for h in VALUE_HINTS) else 1, len(str(c))))
+    for c in ranked:
+        if pd.api.types.is_numeric_dtype(pd.Series([], dtype="float64")):
+            # Actual values are checked after reading; this branch just retains ranking.
+            pass
+    return ranked[0] if ranked else None
+
+
+def _time_to_utc(values: pd.Series, header: dict | None = None, time_col: str = "TIME") -> pd.Series:
+    """Convert common timestamps. Raises rather than guessing mission-relative times."""
+    header = header or {}
+    numeric = pd.to_numeric(values, errors="coerce")
+    if numeric.notna().mean() >= 0.9:
+        nums = numeric.astype(float)
+        magnitude = float(np.nanmedian(np.abs(nums)))
+        # FITS TIME offsets should use their declared reference even when values
+        # happen to be large. Check reference metadata before heuristic epochs.
+        mjdref = header.get("MJDREF")
+        if mjdref is None and ("MJDREFI" in header or "MJDREFF" in header):
+            mjdref = float(header.get("MJDREFI", 0.0)) + float(header.get("MJDREFF", 0.0))
+        if mjdref is not None:
+            unit = str(header.get("TIMEUNIT", "s")).strip().lower()
+            seconds_per_unit = {"s": 1.0, "sec": 1.0, "second": 1.0, "seconds": 1.0, "d": 86400.0, "day": 86400.0, "days": 86400.0}.get(unit)
+            if seconds_per_unit is None:
+                raise ValueError(f"Unknown FITS TIMEUNIT={unit!r}; map it explicitly before merging.")
+            offset = float(header.get("TIMEZERO", 0.0))
+            mjd = float(mjdref) + (nums + offset) * seconds_per_unit / 86400.0
+            return pd.to_datetime(mjd, unit="D", origin=pd.Timestamp("1858-11-17"), utc=True, errors="coerce")
+        if 30000 <= magnitude <= 100000:
+            # Numeric Modified Julian Date.
+            return pd.to_datetime(nums, unit="D", origin=pd.Timestamp("1858-11-17"), utc=True, errors="coerce")
+        if magnitude >= 1e12:
+            return pd.to_datetime(nums, unit="ms", utc=True, errors="coerce")
+        if magnitude >= 1e8:
+            # Common Unix epoch seconds, including the SoLEXS L1 LC product.
+            return pd.to_datetime(nums, unit="s", utc=True, errors="coerce")
+        raise ValueError(
+            f"Numeric {time_col!r} values look like elapsed/mission-relative time, not Unix time, and no MJDREF was found. "
+            "Do not merge until the instrument time reference is verified from its FITS header/manual."
+        )
+    parsed = pd.to_datetime(values, utc=True, errors="coerce")
+    if parsed.notna().mean() >= 0.9:
+        return parsed
+    raise ValueError(f"Could not interpret column {time_col!r} as timestamps. Inspect the file schema first.")
+
+
+def read_light_curve(path: str | Path, source: str, time_col: str | None = None, value_col: str | None = None) -> pd.DataFrame:
+    """Load one light curve and return timestamp, value, source.
+
+    This supports CSV/TXT and table-based FITS light curves. It deliberately does
+    not pretend that a Type-II spectrum/event list is already a light curve.
+    If auto-detection picks the wrong column, pass time_col/value_col explicitly.
+    """
+    path = Path(path)
+    suffixes = "".join(path.suffixes).lower()
+    frame = None
+    header = {}
+    selected_time = time_col
+    selected_value = value_col
+    if suffixes.endswith(".csv") or suffixes.endswith(".txt"):
+        frame = pd.read_csv(path, comment="#", sep=None, engine="python")
+    else:
+        from astropy.io import fits
+        with fits.open(path, memmap=False) as hdus:
+            table_options = []
+            for i, hdu in enumerate(hdus):
+                if getattr(hdu, "columns", None) is not None and hdu.data is not None and len(hdu.data):
+                    names = list(hdu.columns.names or [])
+                    tc = selected_time or _find_time_column(names)
+                    vc = selected_value or (_find_value_column(names, tc) if tc else None)
+                    if tc in names and vc in names:
+                        # Prefer tables with a time axis and a value column.
+                        table_options.append((i, tc, vc))
+            if not table_options:
+                schemas = [(i, list(h.columns.names or [])) for i, h in enumerate(hdus) if getattr(h, "columns", None) is not None]
+                raise ValueError(f"No light-curve-like table found in {path.name}. Tables found: {schemas}. Run scripts/inspect_files.py first.")
+            i, selected_time, selected_value = table_options[0]
+            columns = {}
+            for name in hdus[i].columns.names:
+                arr = np.asarray(hdus[i].data[name]).squeeze()
+
+                # FITS numeric arrays may be big-endian.
+                # Convert them to native byte order before pandas reads them.
+                if arr.dtype.byteorder not in ("=", "|"):
+                    arr = arr.astype(arr.dtype.newbyteorder("="), copy=True)
+
+                columns[name] = arr
+
+            frame = pd.DataFrame(columns)
+            header = dict(hdus[0].header)
+            header.update(dict(hdus[i].header))
+    if frame is None or frame.empty:
+        raise ValueError(f"No rows found in {path.name}")
+    if selected_time is None:
+        selected_time = _find_time_column(frame.columns)
+    if selected_time is None or selected_time not in frame.columns:
+        raise ValueError(f"Cannot identify a time column in {path.name}; columns={list(frame.columns)}")
+    if selected_value is None:
+        selected_value = _find_value_column(frame.columns, selected_time)
+    if selected_value is None or selected_value not in frame.columns:
+        raise ValueError(f"Cannot identify a count/rate/flux column in {path.name}; columns={list(frame.columns)}")
+    timestamps = _time_to_utc(frame[selected_time], header=header, time_col=selected_time)
+    values = pd.to_numeric(frame[selected_value], errors="coerce")
+    result = pd.DataFrame({"timestamp": timestamps, "value": values, "source": source})
+    result = result.dropna(subset=["timestamp", "value"]).sort_values("timestamp")
+    result = result.drop_duplicates(subset=["timestamp"], keep="last").reset_index(drop=True)
+    if result.empty:
+        raise ValueError(f"No usable timestamp/value rows parsed from {path.name}")
+    return result
+
